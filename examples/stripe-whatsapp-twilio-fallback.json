@@ -1,3 +1,439 @@
 
-r
+{
+  "name": "Stripe → WhatsApp → Twilio fallback (idempotent)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stripe-webhook",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true,
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "webhook-stripe",
+      "name": "Webhook (Stripe)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 400],
+      "webhookId": "stripe-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verify Stripe signature — HMAC-SHA256 over `timestamp.rawBody`\n// See https://stripe.com/docs/webhooks/signatures\nconst crypto = require('crypto');\n\nconst secret = $env.STRIPE_WEBHOOK_SECRET;\nif (!secret) throw new Error('Missing STRIPE_WEBHOOK_SECRET env var');\n\nconst item = $input.item;\nconst sigHeader = item.json.headers['stripe-signature'];\nif (!sigHeader) {\n  return { json: { valid: false, reason: 'missing_signature' } };\n}\n\n// Raw body arrives as binary when Webhook `rawBody` option is on\nlet rawBody;\nif (item.binary && item.binary.data) {\n  rawBody = Buffer.from(item.binary.data.data, 'base64').toString('utf8');\n} else {\n  rawBody = JSON.stringify(item.json.body);\n}\n\n// Parse Stripe signature header: t=...,v1=...\nconst parts = Object.fromEntries(\n  sigHeader.split(',').map(p => {\n    const [k, v] = p.split('=');\n    return [k, v];\n  })\n);\nconst timestamp = parts.t;\nconst v1 = parts.v1;\nif (!timestamp || !v1) {\n  return { json: { valid: false, reason: 'malformed_signature' } };\n}\n\n// Reject replays older than 5 minutes\nconst ageSec = Math.floor(Date.now() / 1000) - Number(timestamp);\nif (ageSec > 300) {\n  return { json: { valid: false, reason: 'stale_timestamp', age: ageSec } };\n}\n\nconst signedPayload = `${timestamp}.${rawBody}`;\nconst expected = crypto.createHmac('sha256', secret).update(signedPayload).digest('hex');\n\n// Constant-time compare\nconst a = Buffer.from(expected, 'hex');\nconst b = Buffer.from(v1, 'hex');\nconst valid = a.length === b.length && crypto.timingSafeEqual(a, b);\n\nlet event = {};\ntry { event = JSON.parse(rawBody); } catch (_) {}\n\nreturn {\n  json: {\n    valid,\n    event,\n    event_id: event.id ?? null,\n    event_type: event.type ?? null,\n    payload_hash: crypto.createHash('sha256').update(rawBody).digest('hex')\n  }\n};"
+      },
+      "id": "verify-signature",
+      "name": "Verify Stripe Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-signature-valid",
+      "name": "IF: Signature Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [640, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'invalid_signature', reason: $json.reason } }}",
+        "options": { "responseCode": 400 }
+      },
+      "id": "respond-400",
+      "name": "Respond 400 (Bad Signature)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [840, 600]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT item_key FROM processed_items WHERE item_key = ? AND workflow_name = 'stripe-whatsapp' LIMIT 1",
+        "options": {
+          "queryReplacement": "={{ $json.event_id }}"
+        }
+      },
+      "id": "mysql-check-processed",
+      "name": "MySQL: Already Processed?",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [840, 300],
+      "credentials": {
+        "mySql": {
+          "id": "REPLACE_WITH_MYSQL_CRED_ID",
+          "name": "MySQL (orders DB)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $items().length }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-already-processed",
+      "name": "IF: Already Processed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1040, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'duplicate', event_id: $('Verify Stripe Signature').item.json.event_id } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-duplicate",
+      "name": "Respond 200 (Duplicate)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [1240, 180]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Verify Stripe Signature').item.json.event_type }}",
+              "rightValue": "checkout.session.completed",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-event-type",
+      "name": "IF: checkout.session.completed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1240, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'ignored', event_type: $('Verify Stripe Signature').item.json.event_type } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-ignored",
+      "name": "Respond 200 (Ignored Event)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [1440, 560]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT order_id, customer_name, phone_e164, locale FROM orders WHERE stripe_customer_id = ? OR stripe_session_id = ? ORDER BY created_at DESC LIMIT 1",
+        "options": {
+          "queryReplacement": "={{ $('Verify Stripe Signature').item.json.event.data.object.customer }}, {{ $('Verify Stripe Signature').item.json.event.data.object.id }}"
+        }
+      },
+      "id": "mysql-lookup-customer",
+      "name": "MySQL: Lookup Customer",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [1440, 300],
+      "credentials": {
+        "mySql": {
+          "id": "REPLACE_WITH_MYSQL_CRED_ID",
+          "name": "MySQL (orders DB)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.META_PHONE_NUMBER_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"to\": \"{{ $json.phone_e164 }}\",\n  \"type\": \"template\",\n  \"template\": {\n    \"name\": \"order_confirmation\",\n    \"language\": { \"code\": \"{{ $json.locale || 'en_US' }}\" },\n    \"components\": [\n      {\n        \"type\": \"body\",\n        \"parameters\": [\n          { \"type\": \"text\", \"text\": \"{{ $json.customer_name }}\" },\n          { \"type\": \"text\", \"text\": \"{{ $json.order_id }}\" }\n        ]\n      }\n    ]\n  }\n}",
+        "options": {
+          "timeout": 10000,
+          "response": { "response": { "neverError": true, "fullResponse": true } }
+        }
+      },
+      "id": "http-whatsapp",
+      "name": "Meta Cloud API: Send WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1640, 300],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_META_CRED_ID",
+          "name": "Meta Cloud API (Bearer)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 200,
+              "operator": { "type": "number", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-whatsapp-success",
+      "name": "IF: WhatsApp Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1840, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO processed_items (item_key, workflow_name, status, payload_hash) VALUES (?, 'stripe-whatsapp', 'success', ?) ON DUPLICATE KEY UPDATE status=VALUES(status), processed_at=CURRENT_TIMESTAMP",
+        "options": {
+          "queryReplacement": "={{ $('Verify Stripe Signature').item.json.event_id }}, {{ $('Verify Stripe Signature').item.json.payload_hash }}"
+        }
+      },
+      "id": "mysql-record-whatsapp-success",
+      "name": "MySQL: Record Success (WA)",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [2040, 180],
+      "credentials": {
+        "mySql": {
+          "id": "REPLACE_WITH_MYSQL_CRED_ID",
+          "name": "MySQL (orders DB)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'sent', channel: 'whatsapp', event_id: $('Verify Stripe Signature').item.json.event_id } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-wa-ok",
+      "name": "Respond 200 (WA Sent)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [2240, 180]
+    },
+    {
+      "parameters": {
+        "resource": "sms",
+        "operation": "send",
+        "from": "={{ $env.TWILIO_FROM_NUMBER }}",
+        "to": "={{ $('MySQL: Lookup Customer').item.json.phone_e164 }}",
+        "message": "=Order {{ $('MySQL: Lookup Customer').item.json.order_id }} confirmed. Thank you, {{ $('MySQL: Lookup Customer').item.json.customer_name }}."
+      },
+      "id": "twilio-sms",
+      "name": "Twilio: Send SMS Fallback",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [2040, 420],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "twilioApi": {
+          "id": "REPLACE_WITH_TWILIO_CRED_ID",
+          "name": "Twilio"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO processed_items (item_key, workflow_name, status, payload_hash) VALUES (?, 'stripe-whatsapp', 'success', ?) ON DUPLICATE KEY UPDATE status=VALUES(status), processed_at=CURRENT_TIMESTAMP",
+        "options": {
+          "queryReplacement": "={{ $('Verify Stripe Signature').item.json.event_id }}, {{ $('Verify Stripe Signature').item.json.payload_hash }}"
+        }
+      },
+      "id": "mysql-record-sms-success",
+      "name": "MySQL: Record Success (SMS)",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [2240, 420],
+      "credentials": {
+        "mySql": {
+          "id": "REPLACE_WITH_MYSQL_CRED_ID",
+          "name": "MySQL (orders DB)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'sent', channel: 'sms_fallback', event_id: $('Verify Stripe Signature').item.json.event_id } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-sms-ok",
+      "name": "Respond 200 (SMS Sent)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [2440, 420]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO failed_jobs (workflow_name, item_key, payload, error_message, error_node, retry_count) VALUES ('stripe-whatsapp', ?, ?, ?, ?, 0)",
+        "options": {
+          "queryReplacement": "={{ $('Verify Stripe Signature').item.json.event_id }}, {{ JSON.stringify({ event_type: $('Verify Stripe Signature').item.json.event_type, session_id: $('Verify Stripe Signature').item.json.event.data.object.id }).slice(0, 10000) }}, {{ ($json.error && $json.error.message) || $json.message || 'both channels failed' }}, {{ $json.error && $json.error.node && $json.error.node.name || 'twilio-sms' }}"
+        }
+      },
+      "id": "mysql-failed-jobs",
+      "name": "MySQL: Record failed_jobs",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [2240, 620],
+      "credentials": {
+        "mySql": {
+          "id": "REPLACE_WITH_MYSQL_CRED_ID",
+          "name": "MySQL (orders DB)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'queued_for_retry', event_id: $('Verify Stripe Signature').item.json.event_id } }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-failed-queued",
+      "name": "Respond 200 (Queued)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [2440, 620]
+    },
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Trigger (sub-workflow)",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 900]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO failed_jobs (workflow_name, item_key, payload, error_message, error_node, retry_count) VALUES (?, ?, ?, ?, ?, 0)",
+        "options": {
+          "queryReplacement": "={{ $json.workflow.name }}, {{ $json.execution.id }}, {{ JSON.stringify($json).slice(0, 10000) }}, {{ $json.execution.error.message }}, {{ $json.execution.lastNodeExecuted }}"
+        }
+      },
+      "id": "mysql-error-trigger-log",
+      "name": "MySQL: Log Uncaught Error",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [440, 900],
+      "credentials": {
+        "mySql": {
+          "id": "REPLACE_WITH_MYSQL_CRED_ID",
+          "name": "MySQL (orders DB)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook (Stripe)": {
+      "main": [[{ "node": "Verify Stripe Signature", "type": "main", "index": 0 }]]
+    },
+    "Verify Stripe Signature": {
+      "main": [[{ "node": "IF: Signature Valid?", "type": "main", "index": 0 }]]
+    },
+    "IF: Signature Valid?": {
+      "main": [
+        [{ "node": "MySQL: Already Processed?", "type": "main", "index": 0 }],
+        [{ "node": "Respond 400 (Bad Signature)", "type": "main", "index": 0 }]
+      ]
+    },
+    "MySQL: Already Processed?": {
+      "main": [[{ "node": "IF: Already Processed?", "type": "main", "index": 0 }]]
+    },
+    "IF: Already Processed?": {
+      "main": [
+        [{ "node": "Respond 200 (Duplicate)", "type": "main", "index": 0 }],
+        [{ "node": "IF: checkout.session.completed?", "type": "main", "index": 0 }]
+      ]
+    },
+    "IF: checkout.session.completed?": {
+      "main": [
+        [{ "node": "MySQL: Lookup Customer", "type": "main", "index": 0 }],
+        [{ "node": "Respond 200 (Ignored Event)", "type": "main", "index": 0 }]
+      ]
+    },
+    "MySQL: Lookup Customer": {
+      "main": [[{ "node": "Meta Cloud API: Send WhatsApp", "type": "main", "index": 0 }]]
+    },
+    "Meta Cloud API: Send WhatsApp": {
+      "main": [[{ "node": "IF: WhatsApp Success?", "type": "main", "index": 0 }]]
+    },
+    "IF: WhatsApp Success?": {
+      "main": [
+        [{ "node": "MySQL: Record Success (WA)", "type": "main", "index": 0 }],
+        [{ "node": "Twilio: Send SMS Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "MySQL: Record Success (WA)": {
+      "main": [[{ "node": "Respond 200 (WA Sent)", "type": "main", "index": 0 }]]
+    },
+    "Twilio: Send SMS Fallback": {
+      "main": [
+        [{ "node": "MySQL: Record Success (SMS)", "type": "main", "index": 0 }],
+        [{ "node": "MySQL: Record failed_jobs", "type": "main", "index": 0 }]
+      ]
+    },
+    "MySQL: Record Success (SMS)": {
+      "main": [[{ "node": "Respond 200 (SMS Sent)", "type": "main", "index": 0 }]]
+    },
+    "MySQL: Record failed_jobs": {
+      "main": [[{ "node": "Respond 200 (Queued)", "type": "main", "index": 0 }]]
+    },
+    "Error Trigger (sub-workflow)": {
+      "main": [[{ "node": "MySQL: Log Uncaught Error", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "tags": [
+    { "name": "stripe" },
+    { "name": "production" }
+  ]
+}
 
