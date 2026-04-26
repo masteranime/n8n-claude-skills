@@ -1,0 +1,154 @@
+{
+  "name": "Chain LLM Example: Customer Email Triage (Groq)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "customer-email-triage",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"customer_name\": { \"type\": \"string\" },\n    \"product_mentioned\": { \"type\": \"string\" },\n    \"language\": { \"type\": \"string\", \"enum\": [\"en\", \"es\", \"pt\", \"fr\", \"de\", \"other\"] },\n    \"sentiment\": { \"type\": \"string\", \"enum\": [\"positive\", \"neutral\", \"negative\"] },\n    \"urgency_score\": { \"type\": \"number\", \"minimum\": 0, \"maximum\": 10 },\n    \"contains_pii\": { \"type\": \"boolean\" }\n  },\n  \"required\": [\"customer_name\", \"sentiment\", \"urgency_score\"]\n}",
+        "text": "={{ $json.body.email_content }}",
+        "options": {
+          "systemPromptTemplate": "You extract structured data from customer emails. Extract only what is explicitly stated. Do not infer or guess. If a field is not present in the email, omit it. Detect language from the actual email content. PII includes phone numbers, addresses, full credit card numbers, or government IDs."
+        }
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000002",
+      "name": "Stage 1: Information Extractor",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {
+          "temperature": 0,
+          "maxTokensToSample": 500
+        }
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000003",
+      "name": "Groq Chat (Stage 1)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [480, 480],
+      "credentials": {
+        "groqApi": {
+          "id": "REPLACE_WITH_GROQ_CRED_ID",
+          "name": "Groq account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Validate Stage 1 output before passing to Stage 2\nconst data = $input.item.json.output;\n\nif (!data || !data.customer_name || !data.sentiment || data.urgency_score == null) {\n  throw new Error(`Stage 1 missing required fields: ${JSON.stringify(data)}`);\n}\n\nif (data.urgency_score < 0 || data.urgency_score > 10) {\n  throw new Error(`urgency_score out of range: ${data.urgency_score}`);\n}\n\nreturn { json: { extracted: data, original_email: $('Webhook').item.json.body.email_content } };"
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000004",
+      "name": "Validate Stage 1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Given this extracted customer data:\n\n{{ JSON.stringify($json.extracted, null, 2) }}\n\nClassify into one of: technical_issue, billing_question, cancellation_risk, upsell_opportunity, compliment, other.\n\nThen identify the single most important next action (one short sentence).\n\nReturn JSON with keys: category, next_action, reasoning. No prose, no markdown.",
+        "options": {
+          "systemMessage": "You are a customer support triage analyst. You return only valid JSON. You do not invent categories outside the allowed list."
+        }
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000005",
+      "name": "Stage 2: Classify + Action",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.4,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": {
+          "temperature": 0.2,
+          "maxTokensToSample": 400,
+          "responseFormat": "json_object"
+        }
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000006",
+      "name": "Groq Chat (Stage 2)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [960, 480],
+      "credentials": {
+        "groqApi": {
+          "id": "REPLACE_WITH_GROQ_CRED_ID",
+          "name": "Groq account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Stage 3: Deterministic scoring (NO LLM — math goes in Code, not in LLM)\nconst stage1 = $('Validate Stage 1').item.json.extracted;\nconst stage2 = JSON.parse($input.item.json.text);\n\n// Composite priority score: 0.5 * urgency + 0.3 * sentiment_weight + 0.2 * category_weight\nconst sentimentWeight = stage1.sentiment === 'negative' ? 10 : stage1.sentiment === 'neutral' ? 5 : 1;\nconst categoryWeight = {\n  cancellation_risk: 10,\n  technical_issue: 8,\n  billing_question: 6,\n  upsell_opportunity: 4,\n  compliment: 1,\n  other: 3\n}[stage2.category] ?? 3;\n\nconst priority = (0.5 * stage1.urgency_score) + (0.3 * sentimentWeight) + (0.2 * categoryWeight);\nconst routeTo = priority >= 7 ? 'urgent_queue' : priority >= 4 ? 'standard_queue' : 'low_queue';\n\nreturn {\n  json: {\n    customer: stage1.customer_name,\n    language: stage1.language,\n    contains_pii: stage1.contains_pii ?? false,\n    sentiment: stage1.sentiment,\n    category: stage2.category,\n    next_action: stage2.next_action,\n    priority_score: Number(priority.toFixed(2)),\n    route_to: routeTo,\n    reasoning: stage2.reasoning,\n    processed_at: new Date().toISOString()\n  }\n};"
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000007",
+      "name": "Stage 3: Score + Route (Code)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "a1b2c3d4-0001-0001-0001-000000000008",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1440, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Stage 1: Information Extractor", "type": "main", "index": 0 }]]
+    },
+    "Stage 1: Information Extractor": {
+      "main": [[{ "node": "Validate Stage 1", "type": "main", "index": 0 }]]
+    },
+    "Groq Chat (Stage 1)": {
+      "ai_languageModel": [[{ "node": "Stage 1: Information Extractor", "type": "ai_languageModel", "index": 0 }]]
+    },
+    "Validate Stage 1": {
+      "main": [[{ "node": "Stage 2: Classify + Action", "type": "main", "index": 0 }]]
+    },
+    "Stage 2: Classify + Action": {
+      "main": [[{ "node": "Stage 3: Score + Route (Code)", "type": "main", "index": 0 }]]
+    },
+    "Groq Chat (Stage 2)": {
+      "ai_languageModel": [[{ "node": "Stage 2: Classify + Action", "type": "ai_languageModel", "index": 0 }]]
+    },
+    "Stage 3: Score + Route (Code)": {
+      "main": [[{ "node": "Respond", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "pinData": {},
+  "tags": [
+    { "name": "chain-llm-pattern" },
+    { "name": "example" }
+  ]
+}
