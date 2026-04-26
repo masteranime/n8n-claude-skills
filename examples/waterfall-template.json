@@ -1,0 +1,316 @@
+{
+  "name": "Enrichment Waterfall Template (Hunter → Apollo → SerpAPI+LLM)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "enrich-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 400]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Normalize input\nconst body = $input.item.json.body ?? $input.item.json;\nconst email = body.email?.toLowerCase().trim() ?? '';\nconst firstName = body.first_name?.trim() ?? '';\nconst lastName = body.last_name?.trim() ?? '';\nconst fullName = body.full_name?.trim() ?? `${firstName} ${lastName}`.trim();\nconst company = body.company?.trim() ?? '';\nconst domain = body.domain?.trim() ?? (email.includes('@') ? email.split('@')[1] : '');\n\nif (!email && !fullName && !domain) {\n  throw new Error('Need at least one of: email, full_name, domain');\n}\n\nconst inputKey = email || `${fullName}|${domain || company}`.toLowerCase();\n\nreturn { json: { email, firstName, lastName, fullName, company, domain, inputKey } };"
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000002",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [400, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT enriched_data, source FROM enrichment_cache WHERE input_key = '{{ $json.inputKey }}' AND enriched_at > NOW() - INTERVAL 30 DAY LIMIT 1"
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000003",
+      "name": "Cache Lookup",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [600, 400],
+      "credentials": {
+        "mySql": { "id": "REPLACE_WITH_MYSQL_CRED_ID", "name": "MySQL" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.enriched_data }}",
+              "rightValue": "",
+              "operator": { "type": "object", "operation": "exists" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000004",
+      "name": "IF: Cache Hit?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [800, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { source: 'cache', data: $json.enriched_data } }}"
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000005",
+      "name": "Respond from Cache",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1000, 280]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.hunter.io/v2/email-finder?domain={{ $('Normalize Input').item.json.domain }}&first_name={{ $('Normalize Input').item.json.firstName }}&last_name={{ $('Normalize Input').item.json.lastName }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "api_key", "value": "={{ $credentials.hunterApi.apiKey }}" }
+          ]
+        },
+        "options": {
+          "timeout": 10000,
+          "response": { "response": { "neverError": true } }
+        }
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000006",
+      "name": "Hunter (Vendor 1)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1000, 500],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.data?.email }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000007",
+      "name": "IF: Hunter Hit?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1200, 500]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.apollo.io/api/v1/people/match",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Api-Key", "value": "={{ $credentials.apolloApi.apiKey }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"first_name\": \"{{ $('Normalize Input').item.json.firstName }}\",\n  \"last_name\": \"{{ $('Normalize Input').item.json.lastName }}\",\n  \"organization_name\": \"{{ $('Normalize Input').item.json.company }}\",\n  \"domain\": \"{{ $('Normalize Input').item.json.domain }}\",\n  \"reveal_personal_emails\": true\n}",
+        "options": {
+          "timeout": 12000,
+          "response": { "response": { "neverError": true } }
+        }
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000008",
+      "name": "Apollo (Vendor 2)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1400, 600],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.person?.email }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000009",
+      "name": "IF: Apollo Hit?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1600, 600]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://serpapi.com/search.json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "q", "value": "=\"{{ $('Normalize Input').item.json.fullName }}\" \"{{ $('Normalize Input').item.json.company }}\" site:linkedin.com/in" },
+            { "name": "engine", "value": "google" },
+            { "name": "num", "value": "5" },
+            { "name": "api_key", "value": "={{ $credentials.serpApi.apiKey }}" }
+          ]
+        },
+        "options": {
+          "timeout": 15000,
+          "response": { "response": { "neverError": true } }
+        }
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000010",
+      "name": "SerpAPI (Vendor 3)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1800, 700]
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"linkedin_url\": { \"type\": \"string\" },\n    \"title\": { \"type\": \"string\" },\n    \"location\": { \"type\": \"string\" },\n    \"confidence\": { \"type\": \"number\" }\n  }\n}",
+        "text": "=Search results for {{ $('Normalize Input').item.json.fullName }} at {{ $('Normalize Input').item.json.company }}:\n\n{{ JSON.stringify($json.organic_results?.slice(0,5)) }}\n\nExtract the most likely match for this person. Use only linkedin.com/in URLs. If no clear match, return confidence below 0.5.",
+        "options": {
+          "systemPromptTemplate": "You extract person contact data from Google search results. Only return linkedin.com/in URLs (never /company/ or /pub/). If no result clearly matches the target person, set confidence below 0.5. Do not fabricate data."
+        }
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000011",
+      "name": "LLM Extract (Stage 3)",
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1,
+      "position": [2000, 700]
+    },
+    {
+      "parameters": {
+        "model": "llama-3.3-70b-versatile",
+        "options": { "temperature": 0, "maxTokensToSample": 400 }
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000012",
+      "name": "Groq Chat",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [2000, 880],
+      "credentials": {
+        "groqApi": { "id": "REPLACE_WITH_GROQ_CRED_ID", "name": "Groq" }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Unify output schema across vendors\nconst src = $input.item.json;\nconst input = $('Normalize Input').item.json;\n\nlet unified;\nif (src.data?.email) {\n  // Hunter\n  unified = {\n    email: src.data.email,\n    full_name: `${src.data.first_name ?? ''} ${src.data.last_name ?? ''}`.trim() || input.fullName,\n    company: src.data.company ?? input.company,\n    title: src.data.position ?? null,\n    linkedin_url: src.data.linkedin_url ?? null,\n    phone: src.data.phone_number ?? null,\n    enrichment_source: 'hunter',\n    confidence: (src.data.score ?? 50) / 100,\n    enriched_at: new Date().toISOString()\n  };\n} else if (src.person?.email || src.person?.linkedin_url) {\n  // Apollo\n  const p = src.person;\n  unified = {\n    email: p.email ?? null,\n    full_name: p.name ?? input.fullName,\n    company: p.organization?.name ?? input.company,\n    title: p.title ?? null,\n    linkedin_url: p.linkedin_url ?? null,\n    phone: p.phone_numbers?.[0]?.sanitized_number ?? null,\n    enrichment_source: 'apollo',\n    confidence: p.email_status === 'verified' ? 0.9 : 0.7,\n    enriched_at: new Date().toISOString()\n  };\n} else if (src.output?.linkedin_url) {\n  // SerpAPI + LLM\n  if (src.output.confidence < 0.5) {\n    return { json: { unenrichable: true, reason: 'low_confidence_llm', input } };\n  }\n  unified = {\n    email: null,\n    full_name: input.fullName,\n    company: input.company,\n    title: src.output.title ?? null,\n    linkedin_url: src.output.linkedin_url,\n    phone: null,\n    location: src.output.location ?? null,\n    enrichment_source: 'serpapi_llm',\n    confidence: src.output.confidence,\n    enriched_at: new Date().toISOString()\n  };\n} else {\n  return { json: { unenrichable: true, reason: 'all_vendors_missed', input } };\n}\n\nreturn { json: unified };"
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000013",
+      "name": "Unify Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, 500]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO enrichment_cache (input_key, enriched_data, source, enriched_at) VALUES ('{{ $('Normalize Input').item.json.inputKey }}', '{{ JSON.stringify($json).replace(/'/g, \"''\") }}', '{{ $json.enrichment_source }}', NOW()) ON DUPLICATE KEY UPDATE enriched_data = VALUES(enriched_data), source = VALUES(source), enriched_at = NOW()"
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000014",
+      "name": "Cache Insert",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [2400, 500],
+      "credentials": {
+        "mySql": { "id": "REPLACE_WITH_MYSQL_CRED_ID", "name": "MySQL" }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000015",
+      "name": "Respond Enriched",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2600, 500]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO enrichment_dead_letter (input_key, input_data, reason, attempted_at) VALUES ('{{ $('Normalize Input').item.json.inputKey }}', '{{ JSON.stringify($('Normalize Input').item.json).replace(/'/g, \"''\") }}', '{{ $json.reason }}', NOW())"
+      },
+      "id": "b2c3d4e5-0001-0001-0001-000000000016",
+      "name": "Dead Letter",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [2400, 800],
+      "credentials": {
+        "mySql": { "id": "REPLACE_WITH_MYSQL_CRED_ID", "name": "MySQL" }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]] },
+    "Normalize Input": { "main": [[{ "node": "Cache Lookup", "type": "main", "index": 0 }]] },
+    "Cache Lookup": { "main": [[{ "node": "IF: Cache Hit?", "type": "main", "index": 0 }]] },
+    "IF: Cache Hit?": {
+      "main": [
+        [{ "node": "Respond from Cache", "type": "main", "index": 0 }],
+        [{ "node": "Hunter (Vendor 1)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Hunter (Vendor 1)": { "main": [[{ "node": "IF: Hunter Hit?", "type": "main", "index": 0 }]] },
+    "IF: Hunter Hit?": {
+      "main": [
+        [{ "node": "Unify Output", "type": "main", "index": 0 }],
+        [{ "node": "Apollo (Vendor 2)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Apollo (Vendor 2)": { "main": [[{ "node": "IF: Apollo Hit?", "type": "main", "index": 0 }]] },
+    "IF: Apollo Hit?": {
+      "main": [
+        [{ "node": "Unify Output", "type": "main", "index": 0 }],
+        [{ "node": "SerpAPI (Vendor 3)", "type": "main", "index": 0 }]
+      ]
+    },
+    "SerpAPI (Vendor 3)": { "main": [[{ "node": "LLM Extract (Stage 3)", "type": "main", "index": 0 }]] },
+    "Groq Chat": {
+      "ai_languageModel": [[{ "node": "LLM Extract (Stage 3)", "type": "ai_languageModel", "index": 0 }]]
+    },
+    "LLM Extract (Stage 3)": { "main": [[{ "node": "Unify Output", "type": "main", "index": 0 }]] },
+    "Unify Output": {
+      "main": [[
+        { "node": "Cache Insert", "type": "main", "index": 0 },
+        { "node": "Dead Letter", "type": "main", "index": 0 }
+      ]]
+    },
+    "Cache Insert": { "main": [[{ "node": "Respond Enriched", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  },
+  "pinData": {},
+  "tags": [
+    { "name": "enrichment-waterfall" },
+    { "name": "example" }
+  ]
+}
